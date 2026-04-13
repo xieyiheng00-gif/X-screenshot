@@ -103,6 +103,7 @@ class TieBaCrawler(AbstractCrawler):
             await self._inject_anti_detection_scripts()
 
             self.context_page = await self.browser_context.new_page()
+            await self.enable_keyboard_screenshot(self.context_page)
 
             # First visit Baidu homepage, then click Tieba link to avoid triggering security verification
             await self._navigate_to_tieba_via_baidu()

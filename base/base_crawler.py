@@ -17,10 +17,13 @@
 # 详细许可条款请参阅项目根目录下的LICENSE文件。
 # 使用本代码即表示您同意遵守上述原则和LICENSE中的所有条款。
 
+import os
 from abc import ABC, abstractmethod
+from datetime import datetime
+from pathlib import Path
 from typing import Dict, Optional
 
-from playwright.async_api import BrowserContext, BrowserType, Playwright
+from playwright.async_api import BrowserContext, BrowserType, Page, Playwright
 
 
 class AbstractCrawler(ABC):
@@ -62,6 +65,110 @@ class AbstractCrawler(ABC):
         """
         # Default implementation: fallback to standard mode
         return await self.launch_browser(playwright.chromium, playwright_proxy, user_agent, headless)
+
+    async def enable_keyboard_screenshot(self, page: Page) -> None:
+        """
+        Enable a manual screenshot shortcut on the current Playwright page.
+        Hotkeys: `s` or `Ctrl+Shift+S`.
+        """
+        if getattr(self, "_manual_screenshot_enabled", False):
+            return
+
+        screenshot_dir = Path(os.getcwd()) / "screenshots"
+
+        async def _capture(trigger: str = "s") -> str:
+            return await self.capture_page_screenshot(page, screenshot_dir, trigger)
+
+        context = page.context
+
+        install_hotkey_script = """
+            () => {
+              if (window.__mediaCrawlerScreenshotHookInstalled) return;
+              window.__mediaCrawlerScreenshotHookInstalled = true;
+
+              const isEditable = (target) => {
+                if (!target) return false;
+                if (target.isContentEditable) return true;
+                const tag = target.tagName ? target.tagName.toLowerCase() : "";
+                return tag === "input" || tag === "textarea" || tag === "select";
+              };
+
+              window.addEventListener("keydown", (event) => {
+                const key = (event.key || "").toLowerCase();
+                const hitSimple = key === "s" && !event.ctrlKey && !event.metaKey && !event.altKey && !event.shiftKey;
+                const hitCombo = key === "s" && ((event.ctrlKey && event.shiftKey) || (event.metaKey && event.shiftKey));
+                if (!hitSimple && !hitCombo) return;
+
+                // Keep typing behavior for plain "s" in editable fields.
+                if (hitSimple && isEditable(event.target)) return;
+
+                const trigger = hitCombo ? "Ctrl/Cmd+Shift+S" : "s";
+                if (typeof window.__mediaCrawlerCaptureScreenshot === "function") {
+                  window.__mediaCrawlerCaptureScreenshot(trigger).catch((error) => {
+                    console.error("[Screenshot] capture failed:", error);
+                  });
+                }
+              }, true);
+
+              // Fallback debug button: verifies screenshot binding even if keyboard shortcuts are blocked.
+              const addShotButton = () => {
+                if (document.getElementById("__mediaCrawlerShotBtn")) return;
+                const btn = document.createElement("button");
+                btn.id = "__mediaCrawlerShotBtn";
+                btn.type = "button";
+                btn.innerText = "Shot";
+                btn.style.position = "fixed";
+                btn.style.right = "12px";
+                btn.style.top = "12px";
+                btn.style.zIndex = "2147483647";
+                btn.style.padding = "6px 10px";
+                btn.style.background = "#111";
+                btn.style.color = "#fff";
+                btn.style.border = "1px solid #555";
+                btn.style.borderRadius = "8px";
+                btn.style.cursor = "pointer";
+                btn.style.fontSize = "12px";
+                btn.style.opacity = "1";
+                btn.style.boxShadow = "0 2px 10px rgba(0,0,0,0.4)";
+                btn.style.pointerEvents = "auto";
+                btn.addEventListener("click", () => {
+                  if (typeof window.__mediaCrawlerCaptureScreenshot === "function") {
+                    window.__mediaCrawlerCaptureScreenshot("button").catch((error) => {
+                      console.error("[Screenshot] button capture failed:", error);
+                    });
+                  }
+                });
+                document.documentElement.appendChild(btn);
+              };
+
+              if (document.readyState === "loading") {
+                document.addEventListener("DOMContentLoaded", addShotButton, { once: true });
+              } else {
+                addShotButton();
+              }
+            }
+            """
+
+        await context.expose_function("__mediaCrawlerCaptureScreenshot", _capture)
+        # add_init_script needs executable script text (not only a function literal).
+        await context.add_init_script(script=f"({install_hotkey_script})();")
+        # Also install immediately on the current page (not only on future navigations).
+        await page.evaluate(install_hotkey_script)
+        self._manual_screenshot_enabled = True
+
+    async def capture_page_screenshot(self, page: Page, screenshot_dir: Optional[Path] = None, trigger: str = "manual") -> str:
+        """
+        Capture one screenshot for the given page and print saved path.
+        """
+        target_dir = screenshot_dir or (Path(os.getcwd()) / "screenshots")
+        # Use a filesystem-safe timestamp in the filename.
+        target_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        file_path = target_dir / f"screenshot_{timestamp}.png"
+        await page.screenshot(path=str(file_path))
+        saved_path = str(file_path.resolve())
+        print(f"[Screenshot] ({trigger}) saved: {saved_path}")
+        return saved_path
 
 
 class AbstractLogin(ABC):

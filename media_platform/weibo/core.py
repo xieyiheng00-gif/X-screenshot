@@ -93,6 +93,7 @@ class WeiboCrawler(AbstractCrawler):
 
 
             self.context_page = await self.browser_context.new_page()
+            await self.enable_keyboard_screenshot(self.context_page)
             await self.context_page.goto(self.index_url)
             await asyncio.sleep(2)
 

@@ -93,6 +93,7 @@ class KuaishouCrawler(AbstractCrawler):
 
 
             self.context_page = await self.browser_context.new_page()
+            await self.enable_keyboard_screenshot(self.context_page)
             await self.context_page.goto(f"{self.index_url}?isHome=1")
 
             # Create a client to interact with the kuaishou website.
