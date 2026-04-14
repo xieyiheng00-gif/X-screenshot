@@ -19,7 +19,6 @@
 
 import os
 from abc import ABC, abstractmethod
-from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -161,10 +160,20 @@ class AbstractCrawler(ABC):
         Capture one screenshot for the given page and print saved path.
         """
         target_dir = screenshot_dir or (Path(os.getcwd()) / "screenshots")
-        # Use a filesystem-safe timestamp in the filename.
         target_dir.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        file_path = target_dir / f"screenshot_{timestamp}.png"
+
+        # Save screenshots as sequential numbers: 1.png, 2.png, 3.png, ...
+        existing_indices = [
+            int(file.stem)
+            for file in target_dir.glob("*.png")
+            if file.stem.isdigit()
+        ]
+        next_index = max(existing_indices, default=0) + 1
+        file_path = target_dir / f"{next_index}.png"
+        while file_path.exists():
+            next_index += 1
+            file_path = target_dir / f"{next_index}.png"
+
         await page.screenshot(path=str(file_path))
         saved_path = str(file_path.resolve())
         print(f"[Screenshot] ({trigger}) saved: {saved_path}")
