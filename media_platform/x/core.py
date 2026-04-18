@@ -70,38 +70,13 @@ class XCrawler(AbstractCrawler):
                 )
                 utils.logger.info("[XCrawler] Running with standard Playwright mode.")
 
-            page = await self.browser_context.new_page()
+            page = await self._get_or_create_page()
             await self.enable_keyboard_screenshot(page)
             await self._try_open_x(page)
-            await page.evaluate(
-                """
-                () => {
-                  if (document.getElementById("__mediaCrawlerShotBtn")) return;
-                  const btn = document.createElement("button");
-                  btn.id = "__mediaCrawlerShotBtn";
-                  btn.type = "button";
-                  btn.innerText = "Shot";
-                  btn.style.position = "fixed";
-                  btn.style.right = "12px";
-                  btn.style.top = "12px";
-                  btn.style.zIndex = "2147483647";
-                  btn.style.padding = "6px 10px";
-                  btn.style.background = "#111";
-                  btn.style.color = "#fff";
-                  btn.style.border = "1px solid #555";
-                  btn.style.borderRadius = "8px";
-                  btn.style.cursor = "pointer";
-                  btn.style.fontSize = "12px";
-                  btn.style.opacity = "1";
-                  btn.style.boxShadow = "0 2px 10px rgba(0,0,0,0.4)";
-                  document.documentElement.appendChild(btn);
-                }
-                """
-            )
-            await self.capture_page_screenshot(page, trigger="startup-test")
 
             utils.logger.info(
-                "[XCrawler] x.com is ready. Press 's' or Ctrl+Shift+S to take screenshots. Press Ctrl+C to exit."
+                "[XCrawler] x.com is ready. Press 'c' to start/stop long screenshot, "
+                "or press Ctrl+Shift+C for instant screenshot. Press Ctrl+C to exit."
             )
 
             # Keep browser alive for manual browsing and screenshot capturing.
@@ -109,6 +84,18 @@ class XCrawler(AbstractCrawler):
                 await asyncio.sleep(1)
 
             utils.logger.info("[XCrawler] x.com screenshot mode ended.")
+
+    async def _get_or_create_page(self) -> Page:
+        """
+        Reuse an existing page when available to avoid opening an extra tab/window.
+        """
+        if not self.browser_context:
+            raise RuntimeError("Browser context is not initialized")
+
+        existing_pages = self.browser_context.pages
+        if existing_pages:
+            return existing_pages[0]
+        return await self.browser_context.new_page()
 
     async def _try_open_x(self, page: Page) -> None:
         """
