@@ -71,14 +71,12 @@ class AbstractCrawler(ABC):
         """
         Enable a manual screenshot shortcut on the current Playwright page.
         Hotkeys:
-        - `c`: toggle long screenshot range (start / stop and save).
+        - `c`: scroll down ~1000px and capture automatically.
         - `Ctrl+Shift+C` or `Cmd+Shift+C`: instant screenshot.
         """
         if getattr(self, "_manual_screenshot_enabled", False):
             return
 
-        self._long_screenshot_active = False
-        self._long_screenshot_start_y = 0.0
         self._screenshot_busy = False
 
         screenshot_dir = Path(os.getcwd()) / "screenshots"
@@ -96,33 +94,18 @@ class AbstractCrawler(ABC):
             finally:
                 self._screenshot_busy = False
 
-        async def _toggle_long_capture(scroll_y: float = 0.0) -> str:
+        async def _scroll_and_capture(_scroll_y: float = 0.0) -> str:
             if self._screenshot_busy:
-                print("[Screenshot] Busy, ignore long screenshot toggle.")
+                print("[Screenshot] Busy, ignore auto capture request.")
                 return ""
-
-            current_scroll_y = await self._get_effective_scroll_y(page)
-
-            if not self._long_screenshot_active:
-                self._long_screenshot_active = True
-                self._long_screenshot_start_y = max(0.0, float(current_scroll_y))
-                print(
-                    f"[LongShot] Started at Y={int(self._long_screenshot_start_y)}. "
-                    "Scroll to target end and press 'c' again."
-                )
-                return "started"
 
             self._screenshot_busy = True
             try:
-                end_y = max(0.0, float(current_scroll_y))
-                start_y = self._long_screenshot_start_y
-                self._long_screenshot_active = False
-                return await self.capture_long_screenshot(
-                    page=page,
-                    start_y=start_y,
-                    end_y=end_y,
-                    trigger="c",
-                )
+                current_scroll_y = await self._get_effective_scroll_y(page)
+                target_scroll_y = max(0.0, float(current_scroll_y) + 750.0)
+                await page.evaluate("(y) => window.scrollTo(0, y)", target_scroll_y)
+                await page.wait_for_timeout(180)
+                return await self.capture_page_screenshot(page, trigger="c-auto")
             finally:
                 self._screenshot_busy = False
 
@@ -171,7 +154,7 @@ class AbstractCrawler(ABC):
                 if (hitSimple) {
                   if (typeof window.__mediaCrawlerToggleLongScreenshot === "function") {
                     window.__mediaCrawlerToggleLongScreenshot(window.scrollY || 0).catch((error) => {
-                      console.error("[LongShot] toggle failed:", error);
+                      console.error("[Screenshot] auto capture failed:", error);
                     });
                   }
                   return;
@@ -225,20 +208,77 @@ class AbstractCrawler(ABC):
                 document.documentElement.appendChild(btn);
               };
 
+              const addAutoButton = () => {
+                if (document.getElementById("__mediaCrawlerAutoBtn")) return;
+                const btn = document.createElement("button");
+                btn.id = "__mediaCrawlerAutoBtn";
+                btn.type = "button";
+                btn.innerText = "Auto: OFF";
+                btn.dataset.state = "off";
+                btn.style.position = "fixed";
+                btn.style.right = "108px";
+                btn.style.top = "12px";
+                btn.style.zIndex = "2147483647";
+                btn.style.padding = "6px 10px";
+                btn.style.background = "#2b2b2b";
+                btn.style.color = "#fff";
+                btn.style.border = "1px solid #555";
+                btn.style.borderRadius = "8px";
+                btn.style.cursor = "pointer";
+                btn.style.fontSize = "12px";
+                btn.style.opacity = "1";
+                btn.style.boxShadow = "0 2px 10px rgba(0,0,0,0.4)";
+                btn.style.pointerEvents = "auto";
+                btn.style.minWidth = "84px";
+                btn.title = "Toggle auto capture every 1 second";
+
+                btn.addEventListener("click", () => {
+                  const currentState = btn.dataset.state || "off";
+                  if (currentState === "off") {
+                    btn.dataset.state = "on";
+                    btn.innerText = "Auto: ON";
+                    btn.style.background = "#0d7a2b";
+                    if (window.__mediaCrawlerAutoTimer) {
+                      clearInterval(window.__mediaCrawlerAutoTimer);
+                    }
+                    window.__mediaCrawlerAutoTimer = setInterval(() => {
+                      if (typeof window.__mediaCrawlerToggleLongScreenshot === "function") {
+                        window.__mediaCrawlerToggleLongScreenshot(window.scrollY || 0).catch((error) => {
+                          console.error("[Screenshot] auto timer capture failed:", error);
+                        });
+                      }
+                    }, 1000);
+                    return;
+                  }
+
+                  btn.dataset.state = "off";
+                  btn.innerText = "Auto: OFF";
+                  btn.style.background = "#2b2b2b";
+                  if (window.__mediaCrawlerAutoTimer) {
+                    clearInterval(window.__mediaCrawlerAutoTimer);
+                    window.__mediaCrawlerAutoTimer = null;
+                  }
+                });
+
+                document.documentElement.appendChild(btn);
+              };
+
               if (document.readyState === "loading") {
                 document.addEventListener("DOMContentLoaded", () => {
                   removeShotButton();
+                  addAutoButton();
                   addFolderButton();
                 }, { once: true });
               } else {
                 removeShotButton();
+                addAutoButton();
                 addFolderButton();
               }
             }
             """
 
         await context.expose_function("__mediaCrawlerCaptureScreenshot", _capture)
-        await context.expose_function("__mediaCrawlerToggleLongScreenshot", _toggle_long_capture)
+        await context.expose_function("__mediaCrawlerToggleLongScreenshot", _scroll_and_capture)
         await context.expose_function("__mediaCrawlerCreateScreenshotFolder", _create_screenshot_folder)
         # add_init_script needs executable script text (not only a function literal).
         await context.add_init_script(script=f"({install_hotkey_script})();")
@@ -433,12 +473,28 @@ class AbstractCrawler(ABC):
               const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 0;
               const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
               const viewportCenterX = viewportWidth / 2;
-              const LEFT_EXPAND_PX = 200;
+              const CENTER_BIAS_X = 140; // shift crop window slightly right for X.com layout
+              const RIGHT_APPEND_PX = 140; // widen capture on the right side
 
-              const applyLeftExpand = (left, right) => {
-                const expandedLeft = Math.max(0, left - LEFT_EXPAND_PX);
-                const safeLeft = Math.min(right - 1, expandedLeft);
-                return { left: safeLeft, right };
+              const centerRange = (left, right) => {
+                const width = Math.max(220, right - left);
+                let centeredLeft = Math.floor(viewportCenterX - width / 2 + CENTER_BIAS_X);
+                let centeredRight = centeredLeft + width;
+                if (centeredLeft < 0) {
+                  centeredRight -= centeredLeft;
+                  centeredLeft = 0;
+                }
+                if (centeredRight > viewportWidth) {
+                  const overflow = centeredRight - viewportWidth;
+                  centeredLeft = Math.max(0, centeredLeft - overflow);
+                  centeredRight = viewportWidth;
+                }
+                if (centeredRight <= centeredLeft) {
+                  centeredLeft = 0;
+                  centeredRight = Math.min(viewportWidth, width);
+                }
+                centeredRight = Math.min(viewportWidth, centeredRight + RIGHT_APPEND_PX);
+                return { left: centeredLeft, right: centeredRight };
               };
 
               // User-requested center band on high-resolution screens:
@@ -447,7 +503,7 @@ class AbstractCrawler(ABC):
                 const forcedLeft = Math.floor(viewportWidth * 0.58);
                 const forcedRight = Math.floor(viewportWidth * 0.90);
                 if (forcedRight - forcedLeft >= 220) {
-                  return applyLeftExpand(forcedLeft, forcedRight);
+                  return centerRange(forcedLeft, forcedRight);
                 }
               }
 
@@ -482,14 +538,14 @@ class AbstractCrawler(ABC):
                 const pad = 6;
                 const left = Math.max(0, best.left - pad);
                 const right = Math.min(viewportWidth, best.right + pad);
-                return applyLeftExpand(left, right);
+                return centerRange(left, right);
               }
 
               // 2) Fallback: explicit center column selector.
               const explicit = document.querySelector('[data-testid="primaryColumn"]');
               const explicitBounds = toBounds(explicit);
               if (explicitBounds) {
-                return applyLeftExpand(explicitBounds.left, explicitBounds.right);
+                return centerRange(explicitBounds.left, explicitBounds.right);
               }
 
               // 3) If unsure, do not crop.

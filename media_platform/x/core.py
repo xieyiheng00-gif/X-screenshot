@@ -75,7 +75,7 @@ class XCrawler(AbstractCrawler):
             await self._try_open_x(page)
 
             utils.logger.info(
-                "[XCrawler] x.com is ready. Press 'c' to start/stop long screenshot, "
+                "[XCrawler] x.com is ready. Press 'c' to auto-scroll ~750px and capture, "
                 "or press Ctrl+Shift+C for instant screenshot. Press Ctrl+C to exit."
             )
 
