@@ -17,6 +17,8 @@
 # 详细许可条款请参阅项目根目录下的LICENSE文件。
 # 使用本代码即表示您同意遵守上述原则和LICENSE中的所有条款。
 
+import asyncio
+import json
 import os
 from io import BytesIO
 from abc import ABC, abstractmethod
@@ -115,7 +117,29 @@ class AbstractCrawler(ABC):
             self._active_screenshot_dir = folder_path
             message = f"[Screenshot] Active folder: {folder_path.resolve()}"
             print(message)
-            return message
+            parts = folder_path.name.split("_", 1)
+            account = parts[1] if len(parts) > 1 else ""
+            return json.dumps({"message": message, "account": account})
+
+        async def _auto_next_account() -> None:
+            root_dir = getattr(self, "_screenshot_root_dir", screenshot_dir)
+            folder_path = await self._create_new_screenshot_folder(root_dir)
+            self._active_screenshot_dir = folder_path
+            print(f"[Screenshot] Auto-next folder: {folder_path.resolve()}")
+            parts = folder_path.name.split("_", 1)
+            account = parts[1] if len(parts) > 1 else ""
+
+            async def _navigate_and_restart() -> None:
+                await asyncio.sleep(5)
+                if account:
+                    await page.goto(f"https://x.com/{account}", wait_until="domcontentloaded")
+                await asyncio.sleep(5)
+                await page.evaluate(
+                    "() => { const b = document.getElementById('__mediaCrawlerAutoBtn');"
+                    " if (b && b.dataset.state !== 'on') b.click(); }"
+                )
+
+            asyncio.create_task(_navigate_and_restart())
 
         context = page.context
 
@@ -200,7 +224,14 @@ class AbstractCrawler(ABC):
                 btn.title = "Create numbered folder under screenshots and switch save path";
                 btn.addEventListener("click", () => {
                   if (typeof window.__mediaCrawlerCreateScreenshotFolder === "function") {
-                    window.__mediaCrawlerCreateScreenshotFolder().catch((error) => {
+                    window.__mediaCrawlerCreateScreenshotFolder().then((result) => {
+                      try {
+                        const data = JSON.parse(result);
+                        if (data.account) {
+                          window.location.href = "https://x.com/" + data.account;
+                        }
+                      } catch (e) {}
+                    }).catch((error) => {
                       console.error("[Screenshot] create folder failed:", error);
                     });
                   }
@@ -241,7 +272,27 @@ class AbstractCrawler(ABC):
                     if (window.__mediaCrawlerAutoTimer) {
                       clearInterval(window.__mediaCrawlerAutoTimer);
                     }
+                    const stopDate = new Date("2025-09-01T00:00:00Z");
+                    const tooOld = () => {
+                      const times = document.querySelectorAll("article time[datetime]");
+                      let oldCount = 0;
+                      times.forEach((t) => {
+                        const dt = new Date(t.getAttribute("datetime"));
+                        if (!isNaN(dt) && dt < stopDate) oldCount++;
+                      });
+                      return oldCount > 3;
+                    };
                     window.__mediaCrawlerAutoTimer = setInterval(() => {
+                      if (tooOld()) {
+                        btn.dataset.state = "off";
+                        btn.innerText = "Auto: OFF";
+                        btn.style.background = "#2b2b2b";
+                        clearInterval(window.__mediaCrawlerAutoTimer);
+                        window.__mediaCrawlerAutoTimer = null;
+                        // Hand off to Python: create folder → navigate → 5s → turn Auto ON.
+                        window.__mediaCrawlerAutoNextAccount().catch(console.error);
+                        return;
+                      }
                       if (typeof window.__mediaCrawlerToggleLongScreenshot === "function") {
                         window.__mediaCrawlerToggleLongScreenshot(window.scrollY || 0).catch((error) => {
                           console.error("[Screenshot] auto timer capture failed:", error);
@@ -263,16 +314,51 @@ class AbstractCrawler(ABC):
                 document.documentElement.appendChild(btn);
               };
 
+              const expandShowMore = () => {
+                const labels = ["show more", "read more", "show this thread", "view more"];
+                const candidates = document.querySelectorAll(
+                  '[data-testid="tweet-text-show-more-link"], article [role="button"], article button'
+                );
+                candidates.forEach((el) => {
+                  const txt = (el.innerText || el.textContent || "").trim().toLowerCase();
+                  if (!txt) return;
+                  if (!labels.some((l) => txt === l || txt.startsWith(l))) return;
+                  if (el.getAttribute("aria-disabled") === "true" || el.disabled) return;
+                  const rect = el.getBoundingClientRect();
+                  if (rect.width === 0 && rect.height === 0) return;
+                  el.click();
+                });
+              };
+
+              let expandTimer = null;
+              const scheduleExpand = () => {
+                if (expandTimer) return;
+                expandTimer = setTimeout(() => {
+                  expandTimer = null;
+                  expandShowMore();
+                }, 300);
+              };
+
+              const startAutoExpand = () => {
+                if (window.__mediaCrawlerExpandObserver) return;
+                expandShowMore();
+                const observer = new MutationObserver(scheduleExpand);
+                observer.observe(document.body, { childList: true, subtree: true });
+                window.__mediaCrawlerExpandObserver = observer;
+              };
+
               if (document.readyState === "loading") {
                 document.addEventListener("DOMContentLoaded", () => {
                   removeShotButton();
                   addAutoButton();
                   addFolderButton();
+                  startAutoExpand();
                 }, { once: true });
               } else {
                 removeShotButton();
                 addAutoButton();
                 addFolderButton();
+                startAutoExpand();
               }
             }
             """
@@ -280,6 +366,7 @@ class AbstractCrawler(ABC):
         await context.expose_function("__mediaCrawlerCaptureScreenshot", _capture)
         await context.expose_function("__mediaCrawlerToggleLongScreenshot", _scroll_and_capture)
         await context.expose_function("__mediaCrawlerCreateScreenshotFolder", _create_screenshot_folder)
+        await context.expose_function("__mediaCrawlerAutoNextAccount", _auto_next_account)
         # add_init_script needs executable script text (not only a function literal).
         await context.add_init_script(script=f"({install_hotkey_script})();")
         # Also install immediately on the current page (not only on future navigations).
@@ -363,16 +450,38 @@ class AbstractCrawler(ABC):
     async def _create_new_screenshot_folder(self, root_dir: Optional[Path] = None) -> Path:
         target_root = root_dir or getattr(self, "_screenshot_root_dir", None) or (Path(os.getcwd()) / "screenshots")
         target_root.mkdir(parents=True, exist_ok=True)
+
+        accounts_file = Path(os.getcwd()) / "finance_x_accounts.txt"
+        accounts: list[str] = []
+        if accounts_file.exists():
+            accounts = [
+                line.strip()
+                for line in accounts_file.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
+        def _folder_index(folder: Path) -> int | None:
+            parts = folder.name.split("_", 1)
+            try:
+                return int(parts[0])
+            except ValueError:
+                return None
+
         existing_indices = [
-            int(folder.name)
+            idx
             for folder in target_root.iterdir()
-            if folder.is_dir() and folder.name.isdigit()
+            if folder.is_dir() and (idx := _folder_index(folder)) is not None
         ]
         next_index = max(existing_indices, default=0) + 1
-        folder_path = target_root / str(next_index)
+
+        account_name = accounts[next_index - 1] if next_index - 1 < len(accounts) else ""
+        folder_name = f"{next_index}_{account_name}" if account_name else str(next_index)
+        folder_path = target_root / folder_name
         while folder_path.exists():
             next_index += 1
-            folder_path = target_root / str(next_index)
+            account_name = accounts[next_index - 1] if next_index - 1 < len(accounts) else ""
+            folder_name = f"{next_index}_{account_name}" if account_name else str(next_index)
+            folder_path = target_root / folder_name
         folder_path.mkdir(parents=True, exist_ok=False)
         return folder_path
 
