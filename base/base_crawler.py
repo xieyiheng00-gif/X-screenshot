@@ -274,13 +274,17 @@ class AbstractCrawler(ABC):
                     }
                     const stopDate = new Date("2025-09-01T00:00:00Z");
                     const tooOld = () => {
-                      const times = document.querySelectorAll("article time[datetime]");
-                      let oldCount = 0;
-                      times.forEach((t) => {
-                        const dt = new Date(t.getAttribute("datetime"));
-                        if (!isNaN(dt) && dt < stopDate) oldCount++;
-                      });
-                      return oldCount > 3;
+                      const times = Array.from(document.querySelectorAll("article time[datetime]"));
+                      if (times.length < 5) return false;
+                      for (let i = 0; i <= times.length - 5; i++) {
+                        let allOld = true;
+                        for (let j = 0; j < 5; j++) {
+                          const dt = new Date(times[i + j].getAttribute("datetime"));
+                          if (isNaN(dt) || dt >= stopDate) { allOld = false; break; }
+                        }
+                        if (allOld) return true;
+                      }
+                      return false;
                     };
                     const randn = () => {
                       const u = 1 - Math.random();
