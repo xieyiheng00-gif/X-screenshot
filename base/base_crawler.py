@@ -261,7 +261,7 @@ class AbstractCrawler(ABC):
                 btn.style.boxShadow = "0 2px 10px rgba(0,0,0,0.4)";
                 btn.style.pointerEvents = "auto";
                 btn.style.minWidth = "84px";
-                btn.title = "Toggle auto capture every 1 second";
+                btn.title = "Toggle auto capture (interval: 2 + N(0,1) seconds)";
 
                 btn.addEventListener("click", () => {
                   const currentState = btn.dataset.state || "off";
@@ -270,7 +270,7 @@ class AbstractCrawler(ABC):
                     btn.innerText = "Auto: ON";
                     btn.style.background = "#0d7a2b";
                     if (window.__mediaCrawlerAutoTimer) {
-                      clearInterval(window.__mediaCrawlerAutoTimer);
+                      clearTimeout(window.__mediaCrawlerAutoTimer);
                     }
                     const stopDate = new Date("2025-09-01T00:00:00Z");
                     const tooOld = () => {
@@ -282,23 +282,33 @@ class AbstractCrawler(ABC):
                       });
                       return oldCount > 3;
                     };
-                    window.__mediaCrawlerAutoTimer = setInterval(() => {
-                      if (tooOld()) {
-                        btn.dataset.state = "off";
-                        btn.innerText = "Auto: OFF";
-                        btn.style.background = "#2b2b2b";
-                        clearInterval(window.__mediaCrawlerAutoTimer);
-                        window.__mediaCrawlerAutoTimer = null;
-                        // Hand off to Python: create folder → navigate → 5s → turn Auto ON.
-                        window.__mediaCrawlerAutoNextAccount().catch(console.error);
-                        return;
-                      }
-                      if (typeof window.__mediaCrawlerToggleLongScreenshot === "function") {
-                        window.__mediaCrawlerToggleLongScreenshot(window.scrollY || 0).catch((error) => {
-                          console.error("[Screenshot] auto timer capture failed:", error);
-                        });
-                      }
-                    }, 1000);
+                    const randn = () => {
+                      const u = 1 - Math.random();
+                      const v = Math.random();
+                      return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+                    };
+                    const scheduleNext = () => {
+                      const delayMs = Math.max(500, (2 + randn()) * 1000);
+                      window.__mediaCrawlerAutoTimer = setTimeout(() => {
+                        if (btn.dataset.state !== "on") return;
+                        if (tooOld()) {
+                          btn.dataset.state = "off";
+                          btn.innerText = "Auto: OFF";
+                          btn.style.background = "#2b2b2b";
+                          window.__mediaCrawlerAutoTimer = null;
+                          // Hand off to Python: create folder → navigate → 5s → turn Auto ON.
+                          window.__mediaCrawlerAutoNextAccount().catch(console.error);
+                          return;
+                        }
+                        if (typeof window.__mediaCrawlerToggleLongScreenshot === "function") {
+                          window.__mediaCrawlerToggleLongScreenshot(window.scrollY || 0).catch((error) => {
+                            console.error("[Screenshot] auto timer capture failed:", error);
+                          });
+                        }
+                        scheduleNext();
+                      }, delayMs);
+                    };
+                    scheduleNext();
                     return;
                   }
 
@@ -306,7 +316,7 @@ class AbstractCrawler(ABC):
                   btn.innerText = "Auto: OFF";
                   btn.style.background = "#2b2b2b";
                   if (window.__mediaCrawlerAutoTimer) {
-                    clearInterval(window.__mediaCrawlerAutoTimer);
+                    clearTimeout(window.__mediaCrawlerAutoTimer);
                     window.__mediaCrawlerAutoTimer = null;
                   }
                 });
