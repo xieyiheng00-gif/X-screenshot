@@ -18,6 +18,7 @@ import cmd_arg
 import config
 from base.base_crawler import AbstractCrawler
 from media_platform.x import XCrawler
+from tools.date_picker import ask_date_range
 
 
 class CrawlerFactory:
@@ -33,6 +34,13 @@ crawler: Optional[AbstractCrawler] = None
 
 async def main() -> None:
     global crawler
+
+    start_date, stop_date = ask_date_range()
+    if start_date is None or stop_date is None:
+        print("[Main] No date range selected. Exiting.")
+        return
+    config.START_DATE = start_date
+    config.STOP_DATE = stop_date
 
     await cmd_arg.parse_cmd()
 

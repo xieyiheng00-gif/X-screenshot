@@ -111,28 +111,107 @@ class AbstractCrawler(ABC):
             finally:
                 self._screenshot_busy = False
 
-        async def _create_screenshot_folder() -> str:
+        import urllib.parse as _urlparse
+        import datetime as _dt
+        import config as _cfg_early
+
+        # ── Weekly ranges: newest → oldest ───────────────────────────────────
+        def _compute_week_ranges() -> list:
+            try:
+                newer = _dt.date.fromisoformat(_cfg_early.START_DATE)
+                older = _dt.date.fromisoformat(_cfg_early.STOP_DATE)
+            except (ValueError, AttributeError):
+                return []
+            if newer <= older:
+                return []
+            ranges = []
+            until = newer
+            while until > older:
+                since = max(until - _dt.timedelta(days=7), older)
+                ranges.append((since.isoformat(), until.isoformat()))
+                until = since
+            return ranges  # each entry: (since/older_end, until/newer_end)
+
+        _week_ranges: list = _compute_week_ranges()
+        # State: which week within the current account folder we're on.
+        # -1 means "need a new account folder on next advance".
+        if not hasattr(self, "_week_idx"):
+            self._week_idx = -1          # next week index to use
+            self._account_folder: Optional[Path] = None
+
+        def _search_url_for_week(account: str, since: str, until: str) -> str:
+            if not account:
+                return ""
+            query = f"from:{account} -filter:replies -is:retweet since:{since} until:{until}"
+            return "https://x.com/search?q=" + _urlparse.quote(query) + "&src=typed_query&f=live"
+
+        async def _advance() -> tuple:
+            """
+            Advance to the next week (or new account when weeks exhausted).
+            Returns (account, search_url, week_label).
+            """
             root_dir = getattr(self, "_screenshot_root_dir", screenshot_dir)
-            folder_path = await self._create_new_screenshot_folder(root_dir)
-            self._active_screenshot_dir = folder_path
-            message = f"[Screenshot] Active folder: {folder_path.resolve()}"
-            print(message)
-            parts = folder_path.name.split("_", 1)
-            account = parts[1] if len(parts) > 1 else ""
-            return json.dumps({"message": message, "account": account})
+
+            if _week_ranges:
+                # Need a new account folder?
+                if self._week_idx < 0 or self._account_folder is None:
+                    self._account_folder = await self._create_new_screenshot_folder(root_dir)
+                    self._week_idx = 0
+
+                # Wrap around to new account when all weeks done
+                if self._week_idx >= len(_week_ranges):
+                    self._account_folder = await self._create_new_screenshot_folder(root_dir)
+                    self._week_idx = 0
+
+                since, until = _week_ranges[self._week_idx]
+                self._week_idx += 1
+
+                week_label = f"{since} to {until}"
+                week_folder = self._account_folder / week_label
+                week_folder.mkdir(parents=True, exist_ok=True)
+                self._active_screenshot_dir = week_folder
+
+                parts = self._account_folder.name.split("_", 1)
+                account = parts[1] if len(parts) > 1 else ""
+                search_url = _search_url_for_week(account, since, until)
+
+                print(f"[Screenshot] Week folder : {week_folder.resolve()}")
+                if search_url:
+                    print(f"[Screenshot] Search URL  : {search_url}")
+                return account, search_url, week_label
+
+            else:
+                # No weekly ranges configured – fall back to plain account folder
+                folder_path = await self._create_new_screenshot_folder(root_dir)
+                self._active_screenshot_dir = folder_path
+                parts = folder_path.name.split("_", 1)
+                account = parts[1] if len(parts) > 1 else ""
+                search_url = ""
+                if account:
+                    start = getattr(_cfg_early, "START_DATE", "")
+                    stop = getattr(_cfg_early, "STOP_DATE", "")
+                    query = f"from:{account} -filter:replies -is:retweet"
+                    if stop:
+                        query += f" since:{stop}"
+                    if start:
+                        query += f" until:{start}"
+                    search_url = "https://x.com/search?q=" + _urlparse.quote(query) + "&src=typed_query&f=live"
+                return account, search_url, ""
+
+        async def _create_screenshot_folder() -> str:
+            account, search_url, week_label = await _advance()
+            active = str(self._active_screenshot_dir.resolve()) if self._active_screenshot_dir else ""
+            message = f"[Screenshot] Active folder: {active}"
+            return json.dumps({"message": message, "account": account, "search_url": search_url})
 
         async def _auto_next_account() -> None:
-            root_dir = getattr(self, "_screenshot_root_dir", screenshot_dir)
-            folder_path = await self._create_new_screenshot_folder(root_dir)
-            self._active_screenshot_dir = folder_path
-            print(f"[Screenshot] Auto-next folder: {folder_path.resolve()}")
-            parts = folder_path.name.split("_", 1)
-            account = parts[1] if len(parts) > 1 else ""
+            account, search_url, _week_label = await _advance()
 
             async def _navigate_and_restart() -> None:
                 await asyncio.sleep(5)
-                if account:
-                    await page.goto(f"https://x.com/{account}", wait_until="domcontentloaded")
+                dest = search_url or (f"https://x.com/{account}" if account else "")
+                if dest:
+                    await page.goto(dest, wait_until="domcontentloaded")
                 await asyncio.sleep(5)
                 await page.evaluate(
                     "() => { const b = document.getElementById('__mediaCrawlerAutoBtn');"
@@ -206,7 +285,7 @@ class AbstractCrawler(ABC):
                 const btn = document.createElement("button");
                 btn.id = "__mediaCrawlerFolderBtn";
                 btn.type = "button";
-                btn.innerText = "New Folder";
+                btn.innerText = "New Folder/Next Week";
                 btn.style.position = "fixed";
                 btn.style.right = "12px";
                 btn.style.top = "12px";
@@ -221,13 +300,15 @@ class AbstractCrawler(ABC):
                 btn.style.opacity = "1";
                 btn.style.boxShadow = "0 2px 10px rgba(0,0,0,0.4)";
                 btn.style.pointerEvents = "auto";
-                btn.title = "Create numbered folder under screenshots and switch save path";
+                btn.title = "Advance to next week folder and navigate to its date-filtered search";
                 btn.addEventListener("click", () => {
                   if (typeof window.__mediaCrawlerCreateScreenshotFolder === "function") {
                     window.__mediaCrawlerCreateScreenshotFolder().then((result) => {
                       try {
                         const data = JSON.parse(result);
-                        if (data.account) {
+                        if (data.search_url) {
+                          window.location.href = data.search_url;
+                        } else if (data.account) {
                           window.location.href = "https://x.com/" + data.account;
                         }
                       } catch (e) {}
@@ -247,7 +328,7 @@ class AbstractCrawler(ABC):
                 btn.innerText = "Auto: OFF";
                 btn.dataset.state = "off";
                 btn.style.position = "fixed";
-                btn.style.right = "108px";
+                btn.style.right = "210px";
                 btn.style.top = "12px";
                 btn.style.zIndex = "2147483647";
                 btn.style.padding = "6px 10px";
@@ -272,20 +353,27 @@ class AbstractCrawler(ABC):
                     if (window.__mediaCrawlerAutoTimer) {
                       clearTimeout(window.__mediaCrawlerAutoTimer);
                     }
-                    const stopDate = new Date("2025-09-01T00:00:00Z");
-                    const tooOld = () => {
-                      const times = Array.from(document.querySelectorAll("article time[datetime]"));
-                      if (times.length < 5) return false;
-                      for (let i = 0; i <= times.length - 5; i++) {
-                        let allOld = true;
-                        for (let j = 0; j < 5; j++) {
-                          const dt = new Date(times[i + j].getAttribute("datetime"));
-                          if (isNaN(dt) || dt >= stopDate) { allOld = false; break; }
-                        }
-                        if (allOld) return true;
+
+                    // Detect end-of-week by scroll stall: 3 consecutive captures
+                    // already at the bottom means no new tweets are loading.
+                    if (typeof window.__mediaCrawlerBottomCount === "undefined") {
+                      window.__mediaCrawlerBottomCount = 0;
+                    }
+                    const checkDoneWithWeek = () => {
+                      const scrollY = window.scrollY || 0;
+                      const innerH = window.innerHeight || 0;
+                      const scrollH = Math.max(
+                        document.body.scrollHeight,
+                        document.documentElement.scrollHeight
+                      );
+                      if (scrollH - scrollY - innerH < 150) {
+                        window.__mediaCrawlerBottomCount = (window.__mediaCrawlerBottomCount || 0) + 1;
+                      } else {
+                        window.__mediaCrawlerBottomCount = 0;
                       }
-                      return false;
+                      return window.__mediaCrawlerBottomCount >= 3;
                     };
+
                     const randn = () => {
                       const u = 1 - Math.random();
                       const v = Math.random();
@@ -295,12 +383,12 @@ class AbstractCrawler(ABC):
                       const delayMs = Math.max(500, (2 + randn()) * 1000);
                       window.__mediaCrawlerAutoTimer = setTimeout(() => {
                         if (btn.dataset.state !== "on") return;
-                        if (tooOld()) {
+                        if (checkDoneWithWeek()) {
                           btn.dataset.state = "off";
                           btn.innerText = "Auto: OFF";
                           btn.style.background = "#2b2b2b";
                           window.__mediaCrawlerAutoTimer = null;
-                          // Hand off to Python: create folder → navigate → 5s → turn Auto ON.
+                          // Hand off to Python: advance week → navigate → 5s → turn Auto ON.
                           window.__mediaCrawlerAutoNextAccount().catch(console.error);
                           return;
                         }
