@@ -1,22 +1,3 @@
-# -*- coding: utf-8 -*-
-# Copyright (c) 2025 relakkes@gmail.com
-#
-# This file is part of MediaCrawler project.
-# Repository: https://github.com/NanmiCoder/MediaCrawler/blob/main/base/base_crawler.py
-# GitHub: https://github.com/NanmiCoder
-# Licensed under NON-COMMERCIAL LEARNING LICENSE 1.1
-#
-
-# 声明：本代码仅供学习和研究目的使用。使用者应遵守以下原则：
-# 1. 不得用于任何商业用途。
-# 2. 使用时应遵守目标平台的使用条款和robots.txt规则。
-# 3. 不得进行大规模爬取或对平台造成运营干扰。
-# 4. 应合理控制请求频率，避免给目标平台带来不必要的负担。
-# 5. 不得用于任何非法或不当的用途。
-#
-# 详细许可条款请参阅项目根目录下的LICENSE文件。
-# 使用本代码即表示您同意遵守上述原则和LICENSE中的所有条款。
-
 import asyncio
 import json
 import os
@@ -104,7 +85,9 @@ class AbstractCrawler(ABC):
             self._screenshot_busy = True
             try:
                 current_scroll_y = await self._get_effective_scroll_y(page)
-                target_scroll_y = max(0.0, float(current_scroll_y) + 750.0)
+                viewport_h = float(await page.evaluate("() => window.innerHeight || 768"))
+                scroll_step = viewport_h * (4 / 5)
+                target_scroll_y = max(0.0, float(current_scroll_y) + scroll_step)
                 await page.evaluate("(y) => window.scrollTo(0, y)", target_scroll_y)
                 await page.wait_for_timeout(180)
                 return await self.capture_page_screenshot(page, trigger="c-auto")
@@ -205,10 +188,22 @@ class AbstractCrawler(ABC):
             return json.dumps({"message": message, "account": account, "search_url": search_url})
 
         async def _auto_next_account() -> None:
+            # Detect whether the next advance crosses an account boundary
+            # (either weeks are exhausted, or we have no account folder yet).
+            is_new_account = (
+                not _week_ranges
+                or self._week_idx < 0
+                or self._account_folder is None
+                or self._week_idx >= len(_week_ranges)
+            )
+            pre_nav_sleep = 180 if is_new_account else 60
+            boundary = "account" if is_new_account else "week"
+            print(f"[Screenshot] End of {boundary}. Pausing {pre_nav_sleep}s before next batch.")
+
             account, search_url, _week_label = await _advance()
 
             async def _navigate_and_restart() -> None:
-                await asyncio.sleep(5)
+                await asyncio.sleep(pre_nav_sleep)
                 dest = search_url or (f"https://x.com/{account}" if account else "")
                 if dest:
                     await page.goto(dest, wait_until="domcontentloaded")
@@ -366,7 +361,7 @@ class AbstractCrawler(ABC):
                         document.body.scrollHeight,
                         document.documentElement.scrollHeight
                       );
-                      if (scrollH - scrollY - innerH < 150) {
+                      if (scrollH - scrollY - innerH < innerH * 0.15) {
                         window.__mediaCrawlerBottomCount = (window.__mediaCrawlerBottomCount || 0) + 1;
                       } else {
                         window.__mediaCrawlerBottomCount = 0;
@@ -677,90 +672,39 @@ class AbstractCrawler(ABC):
     async def _get_primary_column_bounds(self, page: Page) -> Optional[Dict[str, int]]:
         """
         Get X-axis crop bounds for x.com middle feed area.
+        All values are derived from live DOM geometry so the result adapts to
+        any viewport / monitor size without hardcoded pixel constants.
         """
         return await page.evaluate(
             """
             () => {
-              const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 0;
-              const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
-              const viewportCenterX = viewportWidth / 2;
-              const CENTER_BIAS_X = 140; // shift crop window slightly right for X.com layout
-              const RIGHT_APPEND_PX = 140; // widen capture on the right side
+              const W   = window.innerWidth || document.documentElement.clientWidth || 0;
+              const DPR = window.devicePixelRatio || 1;
+              if (W <= 0) return null;
 
-              const centerRange = (left, right) => {
-                const width = Math.max(220, right - left);
-                let centeredLeft = Math.floor(viewportCenterX - width / 2 + CENTER_BIAS_X);
-                let centeredRight = centeredLeft + width;
-                if (centeredLeft < 0) {
-                  centeredRight -= centeredLeft;
-                  centeredLeft = 0;
-                }
-                if (centeredRight > viewportWidth) {
-                  const overflow = centeredRight - viewportWidth;
-                  centeredLeft = Math.max(0, centeredLeft - overflow);
-                  centeredRight = viewportWidth;
-                }
-                if (centeredRight <= centeredLeft) {
-                  centeredLeft = 0;
-                  centeredRight = Math.min(viewportWidth, width);
-                }
-                centeredRight = Math.min(viewportWidth, centeredRight + RIGHT_APPEND_PX);
-                return { left: centeredLeft, right: centeredRight };
+              // X.com layout formula (CSS pixels) ——————————————————————————
+              // W_nav: left sidebar (icon-only below 1265 px, full above)
+              const W_nav = W >= 1265 ? 275 : 80;
+              // 1225 = total fixed width of 3-column block (275 nav + 600 feed + 350 sidebar)
+
+              let X_pos;
+              if (W < 685) {
+                X_pos = 0;
+              } else if (W < 1090) {
+                X_pos = W_nav;
+              } else {
+                X_pos = (W - 1225) / 2 + W_nav;
+              }
+
+              const X_end = X_pos + Math.min(W, 600);
+
+              // Multiply by DPR so the returned values are in physical pixels,
+              // matching what Playwright's page.screenshot() produces.
+              const PAD = 6;
+              return {
+                left:  Math.max(0, Math.round((X_pos - PAD) * DPR)),
+                right: Math.round((X_end  + PAD) * DPR),
               };
-
-              // User-requested center band on high-resolution screens:
-              // roughly x=1500..2300 on a 2560px-wide viewport.
-              if (viewportWidth >= 2200) {
-                const forcedLeft = Math.floor(viewportWidth * 0.58);
-                const forcedRight = Math.floor(viewportWidth * 0.90);
-                if (forcedRight - forcedLeft >= 220) {
-                  return centerRange(forcedLeft, forcedRight);
-                }
-              }
-
-              const toBounds = (el) => {
-                if (!el) return null;
-                const rect = el.getBoundingClientRect();
-                const left = Math.max(0, Math.floor(rect.left));
-                const right = Math.min(viewportWidth, Math.ceil(rect.right));
-                const width = right - left;
-                if (width < 220) return null;
-                return { left, right, width, center: left + width / 2 };
-              };
-
-              // 1) Prefer visible tweet/article bounds nearest to screen center.
-              // This is narrower and avoids including left nav.
-              const candidates = Array.from(document.querySelectorAll("article"))
-                .map((el) => ({ el, b: toBounds(el) }))
-                .filter((x) => x.b && x.b.width >= 260 && x.b.width <= Math.max(900, viewportWidth))
-                .filter((x) => {
-                  const r = x.el.getBoundingClientRect();
-                  return r.bottom > 0 && r.top < viewportHeight;
-                })
-                .map((x) => ({
-                  left: x.b.left,
-                  right: x.b.right,
-                  score: Math.abs(x.b.center - viewportCenterX)
-                }))
-                .sort((a, b) => a.score - b.score);
-
-              if (candidates.length > 0) {
-                const best = candidates[0];
-                const pad = 6;
-                const left = Math.max(0, best.left - pad);
-                const right = Math.min(viewportWidth, best.right + pad);
-                return centerRange(left, right);
-              }
-
-              // 2) Fallback: explicit center column selector.
-              const explicit = document.querySelector('[data-testid="primaryColumn"]');
-              const explicitBounds = toBounds(explicit);
-              if (explicitBounds) {
-                return centerRange(explicitBounds.left, explicitBounds.right);
-              }
-
-              // 3) If unsure, do not crop.
-              return null;
             }
             """
         )
